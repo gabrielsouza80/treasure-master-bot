@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+debug/*.mp4
+debug/*.png
+debug/*.jpg
+debug/frames/
+
+debug/*.json
+debug/*.csv
+debug/opencv/
