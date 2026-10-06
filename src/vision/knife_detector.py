@@ -12,6 +12,7 @@ import numpy as np
 from src.states.game_state import GameState
 
 ANGLE_BINS = 720
+MIN_SEPARATION_DEG = 8.
 _RADII = np.linspace(.85, 1.90, 106, dtype=np.float32)
 _THETA = np.arange(ANGLE_BINS, dtype=np.float32) * (2 * np.pi / ANGLE_BINS)
 _SIN, _COS = np.sin(_THETA)[:, None], np.cos(_THETA)[:, None]
@@ -41,6 +42,7 @@ class KnifeCandidate:
     angle_deg: float
     score: float
     radial_support: tuple[float, float, float]
+    visible_fraction: float = 1.
 
 
 @dataclass(frozen=True)
@@ -88,7 +90,22 @@ def _body_radius(frame, target):
     return float(radius * radii[peaks[-1]]) if peaks else float(radius)
 
 
-def detect_knives(frame, target, *, state=GameState.UNKNOWN):
+def hud_mask(world_x, world_y, width, height):
+    """Screen-fixed sample layout: gift disk, boost/reward icons, speaker.
+
+    Mask the gift's circular footprint rather than its old bounding rectangle.
+    Unknown layouts still need calibration; these are occlusions, not evidence.
+    """
+    hud = ((world_x - .10 * width)**2 + (world_y - .315 * height)**2 < (.103 * width)**2)
+    hud |= ((world_x < .16 * width) & (world_y > .19 * height) & (world_y < .26 * height))
+    hud |= ((world_x > .877 * width) & (world_x < .923 * width)
+            & (world_y > .286 * height) & (world_y < .317 * height))
+    hud |= ((world_x > .85 * width) & (world_x < .98 * width)
+            & (world_y > .19 * height) & (world_y < .26 * height))
+    return hud
+
+
+def detect_knives(frame, target, *, state=GameState.UNKNOWN, debug=False):
     """Return raw candidates, sorted in clockwise angles from the top.
 
     Detection runs only when state is explicitly confirmed PLAYING. Structured
@@ -121,24 +138,24 @@ def detect_knives(frame, target, *, state=GameState.UNKNOWN):
     # Screen-fixed gift/boost/speaker UI can line up with a target decoration
     # and mimic one long radial object. Treat those occluded pixels as unknown,
     # even when that also hides a real hilt; never turn UI into knife evidence.
-    hud = ((world_x < .20 * w) & (world_y > .27 * h) & (world_y < .36 * h))
-    hud |= ((world_x < .16 * w) & (world_y > .19 * h) & (world_y < .26 * h))
-    hud |= ((world_x > .86 * w) & (world_x < .94 * w)
-            & (world_y > .284 * h) & (world_y < .328 * h))
-    hud |= ((world_x > .85 * w) & (world_x < .98 * w)
-            & (world_y > .19 * h) & (world_y < .26 * h))
+    hud = hud_mask(world_x, world_y, w, h)
     foreground[hud] = False
     # Join small radial gaps in ornate knives, then allow narrow side edges.
     # Pad angle dimension explicitly: morphology must also wrap at 0 degrees.
     mask = np.concatenate((foreground[-6:], foreground, foreground[:6])).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 7), np.uint8))
-    mask = cv2.dilate(mask, np.ones((7, 1), np.uint8))[6:-6]
+    mask = cv2.dilate(mask, np.ones((3, 1), np.uint8))[6:-6]
+    mask[hud] = 0  # Morphology must not grow evidence into masked UI.
+    visibility = np.stack([(~hud[:, band]).mean(axis=1) for band in _BANDS])
     supports = np.stack([mask[:, band].mean(axis=1) for band in _BANDS])
+    # Missing pixels are unknown, not negatives. Do not promote a nearly fully
+    # hidden band: every band still needs >=45% directly visible radial pixels.
+    supports = np.divide(supports, visibility, out=np.zeros_like(supports), where=visibility >= .45)
     profile = supports.min(axis=0)
-    profile = np.convolve(np.r_[profile[-3:], profile, profile[:3]], np.ones(7) / 7, 'valid')
+    profile = np.convolve(np.r_[profile[-1:], profile, profile[:1]], np.ones(3) / 3, 'valid')
     # One peak per plateau, rather than selecting every high-scoring bin.
     # The latter can turn a wide ornate hilt/HUD overlap into several knives.
-    maxima = ((profile >= .50) & (profile >= np.roll(profile, 1))
+    maxima = ((profile > 0) & (profile >= np.roll(profile, 1))
               & (profile >= np.roll(profile, -1)))
     starts = np.flatnonzero(maxima & ~np.roll(maxima, 1))
     peaks = []
@@ -148,25 +165,47 @@ def detect_knives(frame, target, *, state=GameState.UNKNOWN):
             length += 1
         peaks.append(float((start + (length - 1) / 2) % ANGLE_BINS))
     selected = []
+    decisions = []
     for peak in sorted(peaks, key=lambda p: profile[round(p) % ANGLE_BINS], reverse=True):
         index = round(peak) % ANGLE_BINS
         score = float(profile[index])
         angle = float(peak * 360 / ANGLE_BINS)
+        reason = None
+        if score < .50:
+            reason = 'threshold_or_occlusion'
         separate = True
         for existing in selected:
             delta = signed_angle_delta(existing.angle_deg, angle)
             arc = (index + np.sign(delta) * np.arange(round(abs(delta) * 2) + 1).astype(int)) % ANGLE_BINS
-            if (abs(delta) < 13 or
+            close_support = (score >= .65 and existing.score >= .65
+                             and supports[1, index] >= .85 and existing.radial_support[1] >= .85)
+            if (abs(delta) < MIN_SEPARATION_DEG or
+                    (abs(delta) < 13 and not close_support) or
                     profile[arc.astype(int)].min() > min(score, existing.score) - .12):
                 separate = False
+                reason = ('minimum_separation' if abs(delta) < MIN_SEPARATION_DEG else
+                          'weak_close_peak' if abs(delta) < 13 and not close_support
+                          else 'no_radial_valley')
                 break
-        if separate:
-            selected.append(KnifeCandidate(angle, score, tuple(float(v) for v in supports[:, index])))
+        if separate and reason is None:
+            selected.append(KnifeCandidate(angle, score, tuple(float(v) for v in supports[:, index]),
+                                           float(visibility[:, index].mean())))
+        if debug:
+            decisions.append(dict(angle_deg=angle, score=score, reason=reason or 'accepted',
+                                  radial_support=supports[:, index].tolist(),
+                                  band_visibility=visibility[:, index].tolist()))
     selected.sort(key=lambda c: c.angle_deg)
-    return KnifeDetectionResult(True, tuple(selected), {
+    diagnostics = {
         'effective_radius': effective_radius,
         'radius_refinement_ratio': effective_radius / radius,
         'annulus': [.85, 1.90], 'support_bands': [[1.02, 1.28], [1.28, 1.52], [1.52, 1.74]],
-        'angular_bins': ANGLE_BINS, 'minimum_separation_deg': 13.,
+        'angular_bins': ANGLE_BINS, 'minimum_separation_deg': MIN_SEPARATION_DEG,
         'hud_masked_fraction': float(hud.mean()),
-    })
+        'hud_occluded_angles': (np.flatnonzero(visibility.min(axis=0) < .85) / 2).tolist(),
+        'partial_candidates': sum(c.visible_fraction < .95 for c in selected),
+        'confidence_is_probability': False,
+    }
+    if debug:
+        diagnostics.update(peak_decisions=decisions, radial_profile=profile.tolist(),
+                           band_support=supports.tolist(), band_visibility=visibility.tolist())
+    return KnifeDetectionResult(True, tuple(selected), diagnostics)

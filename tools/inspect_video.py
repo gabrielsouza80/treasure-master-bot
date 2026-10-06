@@ -15,7 +15,7 @@ from src.states.game_state import GameState, StateStabilizer, classify_game_stat
 from src.vision.target_detector import detect_target
 from src.vision.knife_detector import detect_knives
 from src.vision.knife_tracker import KnifeTracker
-from tools.knife_analysis import KnifeAnalysis, draw_knives
+from tools.knife_analysis import KnifeAnalysis, draw_knives, REVIEW_FRAMES
 
 SAVE_DIR = ROOT / "debug" / "frames"
 
@@ -39,6 +39,8 @@ def annotate(frame, timestamp, target, result, state, raw_knives=None, tracked=N
                    'ANGLES=' + ','.join(f'{a:.1f}' for a in tracked.angles_deg[:6])]
         if len(tracked.angles_deg) > 6:
             labels += ['       ' + ','.join(f'{a:.1f}' for a in tracked.angles_deg[6:])]
+        labels += [f'HELD={len(tracked.occluded_tracks)} PROBABLE={len(tracked.probable_knives)}'
+                   f" UNCERTAIN={tracked.diagnostics.get('count_uncertain', True)}"]
     else:
         labels += ['KNIVES=not evaluated']
     cv2.rectangle(display, (0, 0), (display.shape[1], 23 * len(labels) + 4), (0, 0, 0), -1)
@@ -70,6 +72,7 @@ def main(argv=None):
     parser.add_argument('--report', type=Path, help='Write JSON summary (headless only)')
     parser.add_argument('--csv', type=Path, help='Write per-frame diagnostics (headless only)')
     parser.add_argument('--knife-review', type=Path, help='Save compact knife contact sheets (headless only)')
+    parser.add_argument('--knife-debug', action='store_true', help='Detailed radial peak diagnostics on review frames')
     args = parser.parse_args(argv)
     if (args.report or args.csv or args.knife_review) and not args.headless:
         parser.error('--report, --csv and --knife-review require --headless')
@@ -117,7 +120,8 @@ def main(argv=None):
                 result = classify_game_state(frame, target)
                 state = stabilizer.update(result)
                 knife_started = perf_counter()
-                raw_knives = detect_knives(frame, target, state=state)
+                raw_knives = detect_knives(frame, target, state=state,
+                                           debug=args.knife_debug and index in REVIEW_FRAMES)
                 knife_seconds = perf_counter() - knife_started
                 tracked = knife_tracker.update(raw_knives, target, timestamp, state=state)
                 knife_analysis.update(index, timestamp, frame, target, raw_knives, tracked,

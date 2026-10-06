@@ -173,7 +173,7 @@ class KnifeVideoTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        wanted=set(cls.LABELS)|set(range(528,546))|{1260,3060,4140,4680,5940}
+        wanted=set(cls.LABELS)|set(range(528,546))|{1260,3060,4140,4680,5940,2390,6301,6302,6303,6304}
         cls.frames={}
         cap=cv2.VideoCapture(str(VIDEO))
         if not cap.isOpened():raise AssertionError('Video did not open')
@@ -224,6 +224,23 @@ class KnifeVideoTests(unittest.TestCase):
             self.assertEqual(state,GameState.UNKNOWN)
             result=detect_knives(frame,target,state=state)
             self.assertFalse(result.valid)
+
+    def test_dense_boss_recall_and_sword_edge_negative(self):
+        frame,_=self.frames[2390]
+        result=detect_knives(frame,detect_target(frame),state=GameState.PLAYING,debug=True)
+        # Nine directly visible directions; two gold hilts obscured by HUD.
+        # The known total is eleven; do not turn this into a fabricated label
+        # asserting that the two hidden observations are directly detectable.
+        expected=[37,63,84,101,118,162,182,194,303]
+        self.assertEqual(result.count,9,result.angles_deg)
+        from tools.knife_benchmark import match_angles
+        self.assertEqual(len(match_angles(expected,result.angles_deg,6)),9)
+        self.assertEqual(len(result.diagnostics['radial_profile']),720)
+        self.assertTrue(result.diagnostics['hud_occluded_angles'])
+        for index in (6301,6302,6303,6304):
+            frame,_=self.frames[index]
+            raw=detect_knives(frame,detect_target(frame),state=GameState.PLAYING)
+            self.assertEqual(raw.count,2,(index,raw.angles_deg))
 
 
 if __name__=='__main__':unittest.main()

@@ -3,7 +3,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from src.states.game_state import GameState
-from src.vision.knife_detector import circular_distance, normalize_angle, signed_angle_delta
+from src.vision.knife_detector import (MIN_SEPARATION_DEG, circular_distance,
+                                       normalize_angle, signed_angle_delta)
 
 
 @dataclass
@@ -30,6 +31,7 @@ class KnifeTrackingResult:
     valid: bool
     knives: tuple[TrackedKnife, ...] = ()
     diagnostics: dict = None
+    probable_knives: tuple[TrackedKnife, ...] = ()
 
     @property
     def angles_deg(self):
@@ -39,13 +41,22 @@ class KnifeTrackingResult:
     def count(self):
         return len(self.knives)
 
+    @property
+    def confirmed_observed(self):
+        return tuple(k for k in self.knives if k.observed)
+
+    @property
+    def occluded_tracks(self):
+        return tuple(k for k in self.knives if not k.observed)
+
 
 class KnifeTracker:
     """One-to-one circular matches; three consecutive hits confirm a birth.
 
     Infer a shared step only from multiple consistent matched observations.
-    Hold confirmed misses for at most 12 frames/200ms and only with that shared
-    step. This bridges brief HUD occlusions without retaining counts forever.
+    Hold confirmed misses for at most 12 frames/200ms, or 36 frames/600ms
+    inside a known HUD occlusion, only with a supported shared step.
+    Complete observation loss survives one frame with uncertain positions.
     UNKNOWN, seeking, timestamp gaps, and large target changes reset.
     Counts can rise OR fall; neither monotonic counts nor fixed rotation is
     assumed. Diagnostics expose one-frame noise, count jumps, and residuals.
@@ -121,21 +132,34 @@ class KnifeTracker:
             matched_candidates.add(ci)
         one_frame = 0
         kept = []
+        expired, suppressed_births, merged_ids = [], [], []
+        occlusion_bins = {round(a * 2) % 720 for a in detection.diagnostics.get('hud_occluded_angles', ())}
         for ti, track in enumerate(self.tracks):
             if ti not in matched_tracks:
                 track.misses += 1
                 if not track.confirmed:
                     one_frame += track.hits == 1
                     continue
-                if (not coherent or track.misses > self.max_misses
-                        or timestamp - track.last_seen > .20):
+                predicted = normalize_angle(track.angle + step)
+                bin_index = round(predicted * 2)
+                hud_occluded = any((bin_index + offset) % 720 in occlusion_bins for offset in range(-2,3))
+                limit_frames = max(self.max_misses, 36) if hud_occluded else self.max_misses
+                limit_seconds = .60 if hud_occluded else .20
+                # A completely absent frame remains explicitly uncertain;
+                # no velocity is invented when shared evidence is unavailable.
+                single_loss = not candidates and track.misses == 1
+                if ((not coherent and not single_loss) or track.misses > limit_frames
+                        or timestamp - track.last_seen > limit_seconds):
+                    expired.append(dict(identifier=track.identifier, angle_deg=predicted,
+                                        reason='unsupported_motion' if not coherent else 'hold_expired'))
                     continue
-                track.angle = normalize_angle(track.angle + step)
+                track.angle = predicted
             kept.append(track)
         for ci, candidate in enumerate(candidates):
             if ci not in matched_candidates:
                 # Avoid birthing a second ID beside a briefly held track.
-                if any(circular_distance(candidate.angle_deg, t.angle) < 13 for t in kept):
+                if any(circular_distance(candidate.angle_deg, t.angle) < MIN_SEPARATION_DEG for t in kept):
+                    suppressed_births.append(candidate.angle_deg)
                     continue
                 kept.append(_Track(self.next_id, candidate.angle_deg, candidate.score,
                                    last_seen=float(timestamp)))
@@ -143,8 +167,10 @@ class KnifeTracker:
         # Prefer current evidence over a nearby extrapolated observation.
         unique = []
         for track in sorted(kept, key=lambda t: (t.misses, -t.hits, -t.score)):
-            if not any(circular_distance(track.angle, other.angle) < 13 for other in unique):
+            if not any(circular_distance(track.angle, other.angle) < MIN_SEPARATION_DEG for other in unique):
                 unique.append(track)
+            else:
+                merged_ids.append(track.identifier)
         kept = unique
         self.tracks = kept
         knives = tuple(sorted((TrackedKnife(t.identifier, normalize_angle(t.angle),
@@ -152,6 +178,8 @@ class KnifeTracker:
                                for t in kept if t.confirmed), key=lambda k: k.angle_deg))
         jump = len(knives) - self.last_count
         self.last_count = len(knives)
+        probable = tuple(sorted((TrackedKnife(t.identifier, normalize_angle(t.angle),t.score,True)
+                                 for t in kept if not t.confirmed),key=lambda k:k.angle_deg))
         return KnifeTrackingResult(True, knives, {
             'reset': reason, 'shared_step_deg': step if coherent else None,
             'one_frame_candidates_rejected': one_frame,
@@ -159,4 +187,11 @@ class KnifeTracker:
             'max_match_residual_deg': max(residuals, default=0.),
             'held_tracks': sum(not k.observed for k in knives),
             'pending_candidates': sum(not t.confirmed for t in kept),
-        })
+            'count_uncertain': bool(not knives or probable or expired or any(not k.observed for k in knives)
+                                    or detection.diagnostics.get('partial_candidates', 0) or occlusion_bins),
+            'observation_quality': (sum(k.observed for k in knives) / len(knives)) if knives else 0.,
+            'hold_upper_bound_seconds': .60,
+            'expired_confirmed_tracks': expired,
+            'suppressed_birth_angles': suppressed_births,
+            'merged_track_ids': merged_ids,
+        }, probable)

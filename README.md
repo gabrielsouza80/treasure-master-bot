@@ -71,7 +71,9 @@ means no candidates were detected, not proof that there are no attached knives.
 `src/vision/knife_tracker.py` uses one-to-one circular matches and requires three
 consecutive observations for a new track. It estimates the shared angular step
 from multiple consistent observations and holds missing tracks for at most 12
-frames or 200ms only with that support. This bridges short HUD occlusions.
+frames or 200ms only with that support. A mapped HUD occlusion permits at most
+36 frames or 600ms; expiration still uses time since the last full observation.
+Complete observation loss survives one frame with explicitly uncertain angles.
 Overlapping replacement tracks are suppressed.
 Green rays are current observations; amber rays are briefly held observations.
 UNKNOWN, seeking, backward timestamps, gaps over 150ms, and large target changes
@@ -85,7 +87,44 @@ decoding, target/state detection, knife detection, and tracking; review image an
 CSV writes are excluded from that timing. Overall FPS includes the complete run.
 Reset counts mark state/capture boundaries, not verified physical stage changes.
 Jumps and residuals are review flags, not automatically classification errors.
-`--knife-review` saves 30 representative target crops and two contact sheets.
+`--knife-review` saves representative target crops and contact sheets.
+
+Dense recall diagnostics and a human-labeled calibration benchmark:
+
+```powershell
+.\.venv\Scripts\python.exe tools/inspect_video.py --headless --report debug/knife-benchmark/after.json --csv debug/knife-benchmark/after.csv --knife-review debug/knife-benchmark/review --knife-debug
+.\.venv\Scripts\python.exe tools/knife_benchmark.py debug/knife-benchmark/annotations.json debug/knife-benchmark/after.csv --output debug/knife-benchmark/metrics-after.json
+```
+
+The local ignored annotation file contains sequential frame IDs, decoded
+timestamps, expected counts, approximate angles, categories and explicitly
+excluded ambiguous frames. The evaluator requires every certain frame to be
+PLAYING with the same timestamp. It computes count accuracy/MAE, under/overcount
+rates and maximum-cardinality, minimum-error one-to-one circular angle matching
+within the annotation tolerance (6 degrees here). Missed and extra angles are
+reported individually. Labels come from raw-frame review, not detector outputs.
+This is a calibration benchmark from one recording, not a held-out accuracy claim.
+Video/image fixtures and annotations remain ignored; source regressions include
+the known dense boss and the sword-edge false-positive sequence.
+
+Dense separation uses narrower angular morphology/smoothing and an 8-degree
+minimum, rather than the old 13-degree cutoff. Peaks closer than 13 degrees need
+strong middle-band evidence and an intervening radial valley; this prevents
+counting both edges of a wide sword. Global contrast/support thresholds remain
+unchanged. Masked samples are unknown, with each radial band requiring at least
+45% visible samples before normalization. The gift mask uses its circular
+footprint; speaker/boost/reward masks use fixed normalized layout coordinates.
+These occlusion zones are sample-specific and require validation on new layouts.
+
+`KnifeTrackingResult` separates confirmed observed knives, held/occluded tracks
+and probable unconfirmed births. Diagnostics expose `count_uncertain`, current
+observation quality, expired tracks, suppressed births and merged IDs. An empty
+result, mapped unseen HUD sectors, partial observations or held tracks cannot
+establish a complete knife count. Scores/quality are not calibrated probabilities.
+The inspector displays held/probable counts and uncertainty. Detailed review
+adds annuli, HUD footprints, blue raw peaks, red rejected peaks, magenta probable
+births, per-frame JSON decisions and radial support charts. Ordinary playback
+keeps the green/amber confirmed overlays and existing keyboard controls.
 
 Known limits: HUD overlap, hit flashes, short/dark edges, inaccurate circles,
 and tightly packed knives can cause misses or candidate angle jitter. Raw hits
