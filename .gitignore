@@ -10,3 +10,4 @@ debug/frames/
 debug/*.json
 debug/*.csv
 debug/opencv/
+debug/knife-review/
