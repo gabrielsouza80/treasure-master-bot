@@ -1,0 +1,3 @@
+# Optional read-only UI inspection; verified current PyPI release 2026-10-06.
+-r requirements.txt
+uiautomator2==3.7.0

@@ -133,3 +133,10 @@ knife is outside the annulus. Three-frame confirmation introduces a small birth
 delay. A long radial decoration can still resemble a knife. The reviewed sample
 and synthetic shapes are regression coverage, not validation of unseen skins or
 advertisements. Knife counts must not yet be used to authorize firing.
+
+Observation-only runtime foundations are documented in
+[docs/RUNTIME_FOUNDATION.md](docs/RUNTIME_FOUNDATION.md). Run
+`python tools/run_runtime.py` for offline dry-run orchestration. This milestone
+has no executable Android input backend. External reuse and licensing decisions
+are recorded in [docs/EXTERNAL_REUSE_AUDIT.md](docs/EXTERNAL_REUSE_AUDIT.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
