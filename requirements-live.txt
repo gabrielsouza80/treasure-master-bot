@@ -1,0 +1,3 @@
+# Latest PyAV release compatible with Python 3.11 (19.x requires 3.12).
+-r requirements-android.txt
+av==18.0.0

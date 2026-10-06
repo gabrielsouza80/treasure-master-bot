@@ -10,9 +10,23 @@ class CurrentApp:
     activity: str | None = None
 
 
-def parse_current_app(output):
+def parse_current_app(output, *, display_id=0):
     # Prefer current focus regardless of dump order. mFocusedApp may be stale.
     lines = output.splitlines()
+    # scrcpy creates a virtual display whose null focus may precede display 0.
+    # Scope to the captured physical display, never pick any non-null focus.
+    displays = [(i,int(match.group(1))) for i,line in enumerate(lines)
+                if (match := re.match(r'\s*Display: mDisplayId=(\d+)',line))]
+    top = re.search(r'mTopFocusedDisplayId=(\d+)',output)
+    if top and int(top.group(1)) != display_id:
+        return CurrentApp()
+    if displays:
+        selected = [(i,displays[n+1][0] if n+1<len(displays) else len(lines))
+                    for n,(i,d) in enumerate(displays) if d==display_id]
+        if len(selected)!=1:
+            return CurrentApp()
+        start,end=selected[0]
+        lines=lines[start:end]
     for marker in ('mCurrentFocus=', 'topResumedActivity=', 'mResumedActivity:'):
         records = [line for line in lines if marker in line]
         if records:
@@ -42,7 +56,8 @@ class AdbSession:
         return self._query(['exec-out', 'screencap', '-p'])
 
     def get_current_app(self):
-        return parse_current_app(self._query(['shell', 'dumpsys', 'window', 'windows']).decode('utf-8', errors='replace'))
+        # Android 16 omits focus fields from the 'windows' subcommand.
+        return parse_current_app(self._query(['shell', 'dumpsys', 'window']).decode('utf-8', errors='replace'))
 
     def get_resolution(self):
         output = self._query(['shell', 'wm', 'size']).decode('utf-8', errors='replace')

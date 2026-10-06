@@ -45,7 +45,9 @@ def parse_ui(xml):
         raise ValueError('Malformed UI XML') from exc
     nodes = []
     def walk(element, enabled=True, visible=True):
-        enabled = enabled and element.attrib.get('enabled', 'true') == 'true'
+        # Missing node evidence is unknown, hence disabled for action evidence.
+        default_enabled = 'false' if element.tag == 'node' else 'true'
+        enabled = enabled and element.attrib.get('enabled', default_enabled) == 'true'
         visible = visible and element.attrib.get('visible-to-user', 'true') == 'true'
         if element.tag == 'node':
             yield element, enabled, visible
@@ -60,7 +62,7 @@ def parse_ui(xml):
             bounds = None
         nodes.append(UiNode(a.get('text',''), a.get('content-desc',''), a.get('resource-id',''),
                             a.get('package',''), bounds, a.get('clickable')=='true',
-                            enabled and a.get('enabled')=='true', visible))
+                            enabled, visible))
     return tuple(nodes)
 
 

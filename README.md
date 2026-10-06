@@ -140,3 +140,10 @@ Observation-only runtime foundations are documented in
 has no executable Android input backend. External reuse and licensing decisions
 are recorded in [docs/EXTERNAL_REUSE_AUDIT.md](docs/EXTERNAL_REUSE_AUDIT.md) and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The video-only scrcpy 4.1 live observer and independent UI polling process are
+documented in [docs/LIVE_OBSERVATION.md](docs/LIVE_OBSERVATION.md). Live packages
+are optional (`requirements-live.txt`); offline analysis keeps its existing
+dependencies. `tools/run_live_observer.py` requires explicit device/tool paths
+and cannot enable Android input. Observation evidence and limitations are in
+[docs/LIVE_AD_OBSERVATIONS.md](docs/LIVE_AD_OBSERVATIONS.md).
