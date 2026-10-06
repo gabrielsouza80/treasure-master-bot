@@ -40,6 +40,7 @@ class BotRuntime:
         self.controller = InputController()
         self.watchdog = Watchdog(started_at=clock())
         self.state, self.entered_at = RuntimeState.UNKNOWN, clock()
+        self.last_raw = self.last_tracking = None
         self.counts, self.overhead_seconds = Counter(), 0.
 
     def process(self, packet, snapshot=None):
@@ -69,11 +70,13 @@ class BotRuntime:
             knife_state = game_state if runtime_state == RuntimeState.PLAYING else GameState.UNKNOWN
             raw = detect_knives(packet.frame, target, state=knife_state)
             tracked = self.tracker.update(raw, target, packet.timestamp, state=knife_state)
+            self.last_raw, self.last_tracking = raw, tracked
             count = tracked.count if tracked.valid and knife_state == GameState.PLAYING else 0
             uncertain = (knife_state != GameState.PLAYING
                          or bool((tracked.diagnostics or {}).get('count_uncertain', True)))
             angles = tracked.angles_deg if tracked.valid and knife_state == GameState.PLAYING else []
         else:
+            self.last_raw = self.last_tracking = None
             self.stabilizer.reset()
             self.tracker.reset()
             target, result, game_state = None, None, GameState.UNKNOWN
@@ -109,6 +112,8 @@ class BotRuntime:
                       knife_count=count, knife_count_uncertain=uncertain,
                       target=tuple(map(int,target)) if target is not None else None,
                       knife_angles_deg=angles,
+                      count_uncertain_reasons=(tracked.diagnostics or {}).get('count_uncertain_reasons',[])
+                                             if fresh else ['STALE_FRAME'],
                       current_android_package=snapshot.app.package if snapshot else None,
                       watchdog_status=watchdog.recommendation, watchdog_reason=watchdog.reason, **outcome)
         self.counts[game_state.value] += 1

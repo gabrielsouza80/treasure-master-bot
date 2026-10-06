@@ -75,6 +75,7 @@ class KnifeTracker:
         self.last_time = None
         self.last_target = None
         self.last_count = 0
+        self.expected_count = 0
 
     def update(self, detection, target, timestamp, *, state=GameState.UNKNOWN):
         if state != GameState.PLAYING or not detection.valid or target is None:
@@ -84,6 +85,7 @@ class KnifeTracker:
             return KnifeTrackingResult(False, diagnostics={'reset': 'not_playing', 'had_tracks': had_tracks,
                                                            'one_frame_candidates_rejected': one_frame})
         reason = None
+        target_unstable = False
         if self.last_time is not None:
             dt = timestamp - self.last_time
             if dt <= 0 or dt > .15:
@@ -91,6 +93,7 @@ class KnifeTracker:
             else:
                 x, y, radius = target
                 px, py, pr = self.last_target
+                target_unstable = (np.hypot(x-px,y-py) > .035*pr or abs(radius/pr-1) > .06)
                 if np.hypot(x - px, y - py) > .12 * pr or abs(radius / pr - 1) > .25:
                     reason = 'target_discontinuity'
         if reason:
@@ -180,6 +183,20 @@ class KnifeTracker:
         self.last_count = len(knives)
         probable = tuple(sorted((TrackedKnife(t.identifier, normalize_angle(t.angle),t.score,True)
                                  for t in kept if not t.confirmed),key=lambda k:k.angle_deg))
+        self.expected_count = max(self.expected_count,len(knives))
+        uncertainty = []
+        if not knives: uncertainty.append('NO_CONFIRMED_TRACKS')
+        if probable: uncertainty.append('PENDING_CANDIDATE')
+        if any(not k.observed for k in knives): uncertainty.append('HELD_TRACK')
+        if any(not k.observed and any((round(k.angle_deg*2)+o)%720 in occlusion_bins
+                                      for o in range(-2,3)) for k in knives):
+            uncertainty.append('OCCLUDED_TRACK')
+        if expired: uncertainty.append('EXPIRED_TRACK')
+        if len(knives) < self.expected_count or abs(len(candidates)-len(knives)) >= 2:
+            uncertainty.append('COUNT_DISAGREEMENT')
+        if detection.diagnostics.get('partial_candidates',0): uncertainty.append('PARTIAL_CURRENT_DETECTION')
+        if target_unstable or reason: uncertainty.append('TARGET_UNSTABLE')
+        if abs(jump)>=3: uncertainty.append('COUNT_JUMP')
         return KnifeTrackingResult(True, knives, {
             'reset': reason, 'shared_step_deg': step if coherent else None,
             'one_frame_candidates_rejected': one_frame,
@@ -187,8 +204,8 @@ class KnifeTracker:
             'max_match_residual_deg': max(residuals, default=0.),
             'held_tracks': sum(not k.observed for k in knives),
             'pending_candidates': sum(not t.confirmed for t in kept),
-            'count_uncertain': bool(not knives or probable or expired or any(not k.observed for k in knives)
-                                    or detection.diagnostics.get('partial_candidates', 0) or occlusion_bins),
+            'count_uncertain': bool(uncertainty),
+            'count_uncertain_reasons': uncertainty,
             'observation_quality': (sum(k.observed for k in knives) / len(knives)) if knives else 0.,
             'hold_upper_bound_seconds': .60,
             'expired_confirmed_tracks': expired,
