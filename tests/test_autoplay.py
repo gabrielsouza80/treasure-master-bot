@@ -1,4 +1,5 @@
 import time
+import io
 import unittest
 from unittest.mock import Mock,patch
 import numpy as np
@@ -80,6 +81,27 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(r.reason,'VELOCITY_CHANGE')
         self.assertFalse(estimator.update(tracks(45.),.8).valid)
 
+    def test_acceleration_uses_current_velocity(self):
+        estimator=RotationEstimator()
+        for i in range(16):
+            t=i*.02
+            result=estimator.update(tracks(20+60*t+50*t*t),t)
+        self.assertTrue(result.valid,result)
+        self.assertAlmostEqual(result.angular_velocity_deg_s,90.,places=5)
+        self.assertAlmostEqual(result.angular_acceleration_deg_s2,100.,places=5)
+
+    def test_nonfinite_track_invalidates_without_crashing(self):
+        estimator,_=self.uniform(100.)
+        self.assertFalse(estimator.update(tracks(float('nan')),.32).valid)
+
+    def test_excessive_acceleration_is_not_predictable(self):
+        estimator=RotationEstimator()
+        for i in range(16):
+            t=i*.02
+            result=estimator.update(tracks(20+60*t+400*t*t),t)
+        self.assertFalse(result.valid)
+        self.assertFalse(result.stable)
+
 
 class PredictionTests(unittest.TestCase):
     def test_safe_unsafe_and_timing_envelope(self):
@@ -104,6 +126,33 @@ class PredictionTests(unittest.TestCase):
         self.assertFalse(c.add(0.,.2,.1))
         c.measured_at=time.time()-601
         self.assertFalse(c.valid)
+
+    def test_nonfinite_occlusion_cannot_look_clear(self):
+        result=predict_shot([0.],rotation(),timestamp=10.,horizon_s=.2,timing_error_s=.1,
+                            uncertain=False,impact_sector_visible=True,occluded_angles=[float('nan')])
+        self.assertEqual(result.decision,ShotSafety.UNKNOWN)
+
+
+class CliTests(unittest.TestCase):
+    def test_real_calibration_without_seed_fails_before_capture_or_input(self):
+        from tools import run_autoplay
+        args=['run_autoplay','--serial','mock','--adb','adb','--scrcpy','scrcpy',
+              '--enable-input','--autoplay','--calibrate',
+              '--calibration','debug/runtime-live/test-missing-seed.json',
+              '--calibration-output','debug/runtime-live/test-new-profile.json',
+              '--log','debug/runtime-live/test-new-log.jsonl',
+              '--report','debug/runtime-live/test-new-report.json']
+        with patch('sys.argv',args),patch.object(run_autoplay,'AdbSession') as session,\
+                patch.object(run_autoplay,'ScrcpyFrameSource') as source,\
+                patch.object(run_autoplay,'GameplayInput') as backend,\
+                patch.object(run_autoplay.Path,'exists',return_value=False),\
+                patch('sys.stdout'),patch('sys.stderr',new_callable=io.StringIO) as stderr:
+            session.return_value.get_resolution.return_value=(1080,2340)
+            with self.assertRaises(SystemExit) as error:run_autoplay.main()
+            self.assertEqual(error.exception.code,2)
+            self.assertIn('Valid recent observed flight calibration required',stderr.getvalue())
+            source.assert_not_called()
+            backend.assert_not_called()
 
 
 class InputTests(unittest.TestCase):
@@ -143,7 +192,7 @@ class EngineTests(unittest.TestCase):
         engine=AutoplayEngine(calibration())
         record=dict(runtime_state='PLAYING',watchdog_status='WAIT',target=(540,866,265),knife_count_uncertain=False)
         packet=FramePacket(np.zeros((2,2,3),np.uint8),10.,1,10.)
-        snapshot=UiSnapshot(CurrentApp('game','.Game'),(),10.)
+        snapshot=UiSnapshot(CurrentApp('com.gimica.treasuremaster','com.unity3d.player.UnityPlayerActivity'),(),10.)
         engine.last_target=record['target'];engine.stable_since=9.
         raw=KnifeDetectionResult(True,observation(0.).candidates,{})
         return engine,record,packet,snapshot,raw
@@ -176,6 +225,69 @@ class EngineTests(unittest.TestCase):
         engine.observe_confirmation(record,more,p,1800.,10.1)
         self.assertIsNotNone(engine.pending)
         self.assertEqual(engine.metrics['SHOTS_CONFIRMED'],0)
+
+    def test_calibration_mode_cannot_bypass_missing_measurements(self):
+        for calibrating in (False,True):
+            engine,record,p,s,raw=self.fixture()
+            engine.calibration=FlightCalibration()
+            engine.calibrating=calibrating
+            permit=engine.decide(record,tracks(),raw,rotation(),p,s,10.,tip=1800.)
+            self.assertFalse(permit.allowed)
+            self.assertEqual(permit.reason,'WAIT_CALIBRATION')
+
+    def test_app_mismatch_and_invalid_tracks_block_independently(self):
+        for app in (CurrentApp('browser','activity'),CurrentApp('com.gimica.treasuremaster','adActivity')):
+            engine,record,p,s,raw=self.fixture()
+            snapshot=UiSnapshot(app,(),10.)
+            self.assertFalse(engine.decide(record,tracks(),raw,rotation(),p,snapshot,10.,tip=1800.).allowed)
+        engine,record,p,s,raw=self.fixture()
+        self.assertFalse(engine.decide(record,KnifeTrackingResult(False),raw,rotation(),p,s,10.,tip=1800.).allowed)
+
+    def test_movement_new_birth_and_two_stable_frames_confirm(self):
+        engine,record,p,s,raw=self.fixture()
+        engine.decide(record,tracks(),raw,rotation(),p,s,10.,tip=1800.)
+        engine.fired(record,tracks(),p,1800.,10.)
+        existing=TrackedKnife(1,12.,1.,True)
+        birth=TrackedKnife(2,180.,1.,True)
+        def observe(t,result,tip):
+            packet=FramePacket(p.frame,t,round(t*100),t)
+            engine.observe_confirmation(record,result,packet,tip,t)
+        observe(10.05,tracks(),1700.)
+        observe(10.15,KnifeTrackingResult(True,(existing,),{},(birth,)),None)
+        stable=KnifeTrackingResult(True,(existing,birth),{})
+        observe(10.17,stable,None)
+        self.assertIsNotNone(engine.pending)
+        observe(10.19,stable,None)
+        self.assertIsNone(engine.pending)
+        self.assertFalse(engine.failed)
+        self.assertEqual(engine.metrics['SHOTS_CONFIRMED'],1)
+        self.assertAlmostEqual(engine.shots[-1]['confirmation_latency_ms'],190.)
+        self.assertAlmostEqual(engine.shots[-1]['impact_prediction_dt_ms'],190.)
+
+    def test_tracking_reset_cannot_confirm_with_recycled_identifiers(self):
+        engine,record,p,s,raw=self.fixture()
+        engine.decide(record,tracks(),raw,rotation(),p,s,10.,tip=1800.)
+        engine.fired(record,tracks(),p,1800.,10.)
+        record['runtime_state']='UNKNOWN'
+        packet=FramePacket(p.frame,10.05,2,10.05)
+        engine.observe_confirmation(record,KnifeTrackingResult(False),packet,None,10.05)
+        self.assertTrue(engine.failed)
+        self.assertIsNone(engine.pending)
+        self.assertEqual(engine.metrics['SHOTS_CONFIRMED'],0)
+        self.assertEqual(engine.shots[-1]['confirmation_result'],'CONFIRMATION_INTERRUPTED')
+        record['runtime_state']='PLAYING'
+        self.assertFalse(engine.decide(record,tracks(),raw,rotation(timestamp=10.05),packet,s,10.05,tip=1800.).allowed)
+
+    def test_confirmation_deadline_runs_without_fresh_frames(self):
+        engine,record,p,s,raw=self.fixture()
+        engine.decide(record,tracks(),raw,rotation(),p,s,10.,tip=1800.)
+        engine.fired(record,tracks(),p,1800.,10.)
+        self.assertFalse(engine.check_pending_timeout(11.19))
+        self.assertTrue(engine.check_pending_timeout(11.21))
+        self.assertTrue(engine.failed)
+        self.assertEqual(engine.metrics['SHOTS_UNCONFIRMED'],1)
+        self.assertFalse(engine.check_pending_timeout(11.5))
+        self.assertEqual(engine.metrics['SHOTS_UNCONFIRMED'],1)
 
 
 if __name__=='__main__':unittest.main()

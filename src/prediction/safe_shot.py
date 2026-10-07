@@ -36,6 +36,7 @@ def predict_shot(angles, rotation, *, timestamp, horizon_s, timing_error_s,
     motion=(rotation.angular_velocity_deg_s,rotation.angular_acceleration_deg_s2,
             rotation.velocity_error_deg_s,rotation.residual_deg)
     if (not all(isfinite(v) for v in motion) or not all(isfinite(a) for a in angles)
+            or not all(isfinite(a) for a in occluded_angles)
             or rotation.velocity_error_deg_s<0 or rotation.residual_deg<0
             or not isfinite(rotation.confidence) or rotation.confidence<.6):
         return ShotPrediction(ShotSafety.UNKNOWN,'NONFINITE_MOTION')

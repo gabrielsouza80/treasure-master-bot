@@ -40,6 +40,9 @@ class RotationEstimator:
             self.reset()
             return RotationEstimate(reason='INVALID_TRACKING')
         current={k.identifier:k.angle_deg for k in tracked.confirmed_observed}
+        if not all(isfinite(angle) for angle in current.values()):
+            self.reset()
+            return RotationEstimate(timestamp=timestamp,reason='NONFINITE_TRACK')
         old,previous_time=self.previous,self.last_time
         self.previous,self.last_time=current,timestamp
         if previous_time is None: return RotationEstimate(timestamp=timestamp)
@@ -76,8 +79,15 @@ class RotationEstimator:
         t=np.array([s[0]-timestamp for s in self.samples])
         angles=np.array([s[1] for s in self.samples])
         omega,intercept=np.polyfit(t,angles,1)
-        residual=float(np.max(np.abs(angles-(omega*t+intercept))))
-        acceleration=float(2*np.polyfit(t,angles,2)[0]) if len(t)>=8 else 0.
+        fitted=omega*t+intercept
+        acceleration=0.
+        if len(t)>=8:
+            quadratic,omega,intercept=np.polyfit(t,angles,2)
+            acceleration=float(2*quadratic)
+            fitted=quadratic*t*t+omega*t+intercept
+        # t=0 is the newest observation: predict with current velocity,
+        # rather than the midpoint velocity of an accelerating window.
+        residual=float(np.max(np.abs(angles-fitted)))
         valid=bool(residual<=2.5 and abs(omega)<=600 and abs(acceleration)<=600)
         reason='OK' if valid else 'ACCELERATION_OR_RESIDUAL'
         self.last_estimate=RotationEstimate(valid,timestamp,float(omega),acceleration,

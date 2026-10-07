@@ -2,6 +2,7 @@
 from collections import Counter
 from dataclasses import asdict,dataclass
 from math import hypot
+from src.android.device import CurrentApp
 from src.android.gameplay_input import TapPermit
 from src.prediction.safe_shot import predict_shot,ShotSafety
 from src.vision.knife_detector import circular_distance
@@ -22,10 +23,14 @@ class PendingShot:
 
 
 class AutoplayEngine:
-    def __init__(self,calibration,*,calibrating=False,impact_angle=180.):
+    def __init__(self,calibration,*,calibrating=False,impact_angle=180.,
+                 expected_app=CurrentApp('com.gimica.treasuremaster',
+                                         'com.unity3d.player.UnityPlayerActivity')):
         self.calibration=calibration
         self.calibrating=calibrating
         self.impact_angle=impact_angle
+        self.expected_app=expected_app
+        self.prediction_horizon_s=None
         self.pending=None
         self.failed=False
         self.stable_since=None
@@ -36,20 +41,34 @@ class AutoplayEngine:
         self.last_prediction=None
         self.last_rotation=None
         self.last_decision=None
+        self.last_wait_detail=None
 
-    def observe_confirmation(self,record,tracked,packet,tip,now):
+    def check_pending_timeout(self,now):
+        """A missing frame must not postpone the confirmation deadline."""
         pending=self.pending
-        if not pending:return
-        if now-pending.commanded_at>1.2:
+        if pending and now-pending.commanded_at>1.2:
             self.failed=True; self.metrics['SHOTS_UNCONFIRMED']+=1
             self.shots[-1].update(confirmation_result='SHOT_CONFIRMATION_FAILED')
             self.pending=None
-            return
+            return True
+        return False
+
+    def observe_confirmation(self,record,tracked,packet,tip,now):
+        if self.check_pending_timeout(now):return
+        pending=self.pending
+        if not pending:return
         if packet.timestamp<=pending.source_time or packet.received_at<=pending.commanded_at:return
         if (pending.baseline_tip is not None and tip is not None
                 and tip<pending.baseline_tip-.12*pending.target[2] and pending.movement_at is None):
             pending.movement_at=packet.received_at
-        if record['runtime_state']!='PLAYING' or not tracked or not tracked.valid:return
+        if record['runtime_state']!='PLAYING' or not tracked or not tracked.valid:
+            # Track IDs are reset outside gameplay; never match a later target's
+            # recycled identifiers against this outstanding shot.
+            self.failed=True
+            self.metrics['SHOTS_UNCONFIRMED']+=1
+            self.shots[-1]['confirmation_result']='CONFIRMATION_INTERRUPTED'
+            self.pending=None
+            return
         target=record['target']
         if (target is None or hypot(target[0]-pending.target[0],target[1]-pending.target[1])>.06*pending.target[2]
                 or abs(target[2]/pending.target[2]-1)>.10):return
@@ -77,6 +96,8 @@ class AutoplayEngine:
     def decide(self,record,tracked,raw,rotation,packet,snapshot,now,tip=None):
         self.last_prediction=None
         self.last_rotation=rotation
+        self.prediction_horizon_s=None
+        self.last_wait_detail=None
         def wait(reason):
             self.metrics[reason]+=1
             self.last_decision=reason
@@ -85,22 +106,27 @@ class AutoplayEngine:
         if self.pending:return wait('WAIT_PENDING_SHOT')
         if (record['runtime_state']!='PLAYING' or record['watchdog_status']!='WAIT'
                 or snapshot is None or snapshot.error or not 0<=now-snapshot.observed_at<=.75
+                or snapshot.app != self.expected_app
                 or not 0<=now-packet.received_at<=.08):
             self.stable_since=None
             self.last_count=None
             self.last_target=None
             return wait('WAIT_UNKNOWN')
         target=record['target']
-        if not target or not tracked or not raw or not raw.valid:
+        if not target or not tracked or not tracked.valid or not raw or not raw.valid:
             self.stable_since=None
             return wait('WAIT_UNKNOWN')
-        if tip is None:return wait('WAIT_UNKNOWN')
+        if tip is None:
+            self.last_wait_detail='NO_WAITING_PROJECTILE'
+            return wait('WAIT_UNKNOWN')
         unstable=(self.last_target is None or hypot(target[0]-self.last_target[0],target[1]-self.last_target[1])>.035*target[2]
                   or abs(target[2]/self.last_target[2]-1)>.06)
         self.last_target=target
         if unstable:self.stable_since=now
         if self.stable_since is None:self.stable_since=now
-        if now-self.stable_since<.25:return wait('WAIT_UNKNOWN')
+        if now-self.stable_since<.25:
+            self.last_wait_detail='TARGET_STABILIZATION'
+            return wait('WAIT_UNKNOWN')
         if record['knife_count_uncertain']:
             self.stable_since=None
             return wait('WAIT_UNCERTAIN')
@@ -110,28 +136,17 @@ class AutoplayEngine:
             return wait('UNEXPECTED_COUNT_JUMP')
         self.last_count=count
         if not rotation.valid or not rotation.stable or rotation.reversing:return wait('WAIT_ROTATION')
-        if not self.calibration.valid and not self.calibrating:return wait('WAIT_CALIBRATION')
+        # Calibration mode may refine measured timing, never bypass its gate.
+        # An unmeasured commissioning horizon cannot justify a real tap.
+        if not self.calibration.valid:return wait('WAIT_CALIBRATION')
         visible=not any(circular_distance(a,self.impact_angle)<25
                         for a in raw.diagnostics.get('hud_occluded_angles',()))
         if not visible:return wait('WAIT_UNCERTAIN')
-        if self.calibrating and not self.calibration.valid:
-            # Bootstrap is NOT a flight calibration: require an open swept arc
-            # across the entire bounded commissioning horizon, very slow motion.
-            if abs(rotation.angular_velocity_deg_s)>90:return wait('WAIT_ROTATION')
-            upper=min(.65,max(s['total_s'] for s in self.calibration.samples)+.15) if self.calibration.samples else .65
-            horizons=[.05+i*(upper-.05)/12 for i in range(13)]
-            predictions=[predict_shot(tracked.angles_deg,rotation,timestamp=packet.timestamp,
-                                      horizon_s=h,timing_error_s=.10,impact_angle_deg=self.impact_angle,
-                                      uncertain=False,impact_sector_visible=True,
-                                      occluded_angles=raw.diagnostics.get('hud_occluded_angles',())) for h in horizons]
-            prediction=min(predictions,key=lambda p:(p.nearest_predicted_distance_deg or 0)-(p.required_margin_deg or 180))
-            self.last_prediction=prediction
-            if any(p.decision!=ShotSafety.SAFE for p in predictions):return wait('WAIT_UNSAFE')
-        else:
-            prediction=predict_shot(tracked.angles_deg,rotation,timestamp=packet.timestamp,
-                                    horizon_s=self.calibration.median_s+.04,timing_error_s=self.calibration.timing_error_s,
-                                    impact_angle_deg=self.impact_angle,uncertain=False,impact_sector_visible=True,
-                                    occluded_angles=raw.diagnostics.get('hud_occluded_angles',()))
+        self.prediction_horizon_s=self.calibration.median_s+.04
+        prediction=predict_shot(tracked.angles_deg,rotation,timestamp=packet.timestamp,
+                                horizon_s=self.prediction_horizon_s,timing_error_s=self.calibration.timing_error_s,
+                                impact_angle_deg=self.impact_angle,uncertain=False,impact_sector_visible=True,
+                                occluded_angles=raw.diagnostics.get('hud_occluded_angles',()))
         self.last_prediction=prediction; self.last_rotation=rotation
         if prediction.decision!=ShotSafety.SAFE:return wait('WAIT_UNSAFE' if prediction.decision==ShotSafety.UNSAFE else 'WAIT_UNKNOWN')
         self.metrics['WOULD_FIRE']+=1
@@ -144,7 +159,7 @@ class AutoplayEngine:
                                  {k.identifier for k in tracked.knives},tuple(record['target']),tip)
         self.metrics['REAL_SHOTS_SENT']+=1
         self.shots.append(dict(shot_number=len(self.shots)+1,decision_timestamp=command_at,
-                               input_transport='ADB',impact_prediction_dt_ms=(self.calibration.median_s or .65)*1000,
+                               input_transport='ADB',impact_prediction_dt_ms=self.prediction_horizon_s*1000,
                                rotation_velocity_deg_s=self.last_rotation.angular_velocity_deg_s,
                                predicted_nearest_distance_deg=self.last_prediction.nearest_predicted_distance_deg,
                                collision_margin_deg=self.last_prediction.required_margin_deg,
