@@ -13,13 +13,20 @@ class TapPermit:
     reason: str
 
 
+@dataclass(frozen=True)
+class CalibrationTapPermit(TapPermit):
+    purpose: str
+
+
 class GameplayInput:
     def __init__(self,serial,adb,*,enable_input=False,autoplay=False,max_shots=10,
-                 clock=monotonic,popen=subprocess.Popen,foreground=None):
+                 clock=monotonic,popen=subprocess.Popen,foreground=None,commissioning=False):
         if bool(enable_input)!=bool(autoplay): raise ValueError('Both input flags required')
         if not serial or serial.startswith('-') or not 1<=max_shots<=20:
             raise ValueError('Explicit device and bounded shot limit required')
         self.enabled=bool(enable_input and autoplay)
+        if commissioning and max_shots>3: raise ValueError('Commissioning allows at most 3 shots')
+        self.commissioning=commissioning
         self.serial,self.adb=serial,str(adb)
         self.max_shots=max_shots
         self.clock,self.popen=clock,popen
@@ -33,8 +40,13 @@ class GameplayInput:
 
     def fire(self,permit,resolution,point=(.5,.78)):
         now=self.clock()
+        calibrated_permit=(self.commissioning and isinstance(permit,CalibrationTapPermit)
+                           and permit.purpose in ('TRUE_ZERO','MEASURED_ENVELOPE')
+                           and permit.reason=='COMMISSION_'+permit.purpose)
         if (not permit.allowed or not 0<=now-permit.created_at<=.08 or permit.sequence<=self.last_sequence
-                or permit.reason!='SAFE' or self.failed or self.outstanding
+                or not (permit.reason=='SAFE' and not self.commissioning
+                        and not isinstance(permit,CalibrationTapPermit) or calibrated_permit)
+                or self.failed or self.outstanding
                 or self.process is not None or self.sent>=self.max_shots):
             return 'BLOCKED'
         if not (.47<=point[0]<=.53 and .74<=point[1]<=.81): return 'BLOCKED'

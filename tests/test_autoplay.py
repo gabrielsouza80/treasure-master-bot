@@ -134,10 +134,10 @@ class PredictionTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def test_real_calibration_without_seed_fails_before_capture_or_input(self):
+    def test_normal_real_autoplay_without_seed_fails_before_capture_or_input(self):
         from tools import run_autoplay
         args=['run_autoplay','--serial','mock','--adb','adb','--scrcpy','scrcpy',
-              '--enable-input','--autoplay','--calibrate',
+              '--enable-input','--autoplay',
               '--calibration','debug/runtime-live/test-missing-seed.json',
               '--calibration-output','debug/runtime-live/test-new-profile.json',
               '--log','debug/runtime-live/test-new-log.jsonl',

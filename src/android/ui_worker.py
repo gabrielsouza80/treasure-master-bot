@@ -39,6 +39,25 @@ class LiveUiFactory:
         return UiProbe(ReadOnlyHierarchyClient(AdbSession(self.serial,adb=self.adb),device))
 
 
+class ForegroundProbe:
+    """Autoplay needs fresh foreground identity, not a slow hierarchy dump."""
+    def __init__(self,session,clock=monotonic):
+        self.session,self.clock=session,clock
+
+    def read(self):
+        started=self.clock()
+        try:return UiSnapshot(self.session.get_current_app(),(),started)
+        except Exception:return UiSnapshot(CurrentApp(),(),started,'foreground_query_failed')
+
+
+@dataclass(frozen=True)
+class ForegroundFactory:
+    serial: str
+    adb: str
+
+    def __call__(self):return ForegroundProbe(AdbSession(self.serial,adb=self.adb))
+
+
 def _put_latest(queue, value):
     try:
         queue.put_nowait(value)

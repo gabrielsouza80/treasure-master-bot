@@ -205,6 +205,28 @@ def detect_knives(frame, target, *, state=GameState.UNKNOWN, debug=False):
         'partial_candidates': sum(c.visible_fraction < .95 for c in selected),
         'confidence_is_probability': False,
     }
+    # Negative evidence is separate from the normal candidate threshold.
+    # Proximal shafts must be observable through 360 degrees. Outer HUD pixels
+    # cannot prove absence, but cannot hide a root in this directly visible band.
+    root = (_RADII >= 1.04) & (_RADII <= 1.16)
+    root_bands = ((_RADII >= 1.04) & (_RADII < 1.16),
+                  (_RADII >= 1.16) & (_RADII <= 1.28))
+    root_support = np.stack([(contrast[:, band] > 12).mean(axis=1) for band in root_bands])
+    possible_root = root_support.min(axis=0) >= .50
+    long_support = np.stack([(contrast[:, band] > 12).mean(axis=1) for band in _BANDS])
+    # A short gem/horn is not a shaft. Its outer radial continuation must be
+    # directly visible before absence there can reject a possible knife root.
+    extension = (_RADII >= 1.16) & (_RADII <= 1.74)
+    in_frame = ((world_x >= 1) & (world_x < w-1) & (world_y >= 1) & (world_y < h-1))
+    continuation_visible = ((~hud & in_frame)[:, extension]).all(axis=1)
+    diagnostics.update(
+        zero_evidence_version=1,
+        zero_perimeter_visible=bool(not hud[:, root].any()
+            and continuation_visible[possible_root].all()
+            and ((world_x[:, root] >= 1) & (world_x[:, root] < w-1)
+                 & (world_y[:, root] >= 1) & (world_y[:, root] < h-1)).all()),
+        zero_root_max_support=float(np.minimum(root_support.min(axis=0),long_support.min(axis=0)).max()),
+    )
     if debug:
         diagnostics.update(peak_decisions=decisions, radial_profile=profile.tolist(),
                            band_support=supports.tolist(), band_visibility=visibility.tolist())
